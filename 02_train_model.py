@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import polars as pl  # OPTIMIZATION: Use Polars instead of Pandas - faster and lower memory
+import polars as pl
 from pathlib import Path
 import glob
 from tqdm import tqdm
@@ -38,6 +38,7 @@ def train():
     # Convert to numpy arrays for efficient indexing during training
     # ========================================================================
     print("\nLoading feature tables with Polars...")
+    # Load feature tables with Polars for faster
     
     user_features_df = pl.read_parquet(DATA_DIR / "user_features.parquet")
     restaurant_features_df = pl.read_parquet(DATA_DIR / "restaurant_features.parquet")
@@ -162,9 +163,6 @@ def train():
         
         print(f"  Loss: {avg_loss:.4f}, Elapsed time: {epoch_time:.3f} seconds")
     
-    # ========================================================================
-    # Save model
-    # ========================================================================
     print("\n" + "=" * 60)
     print("TRAINING COMPLETED")
     print("=" * 60)
