@@ -6,6 +6,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app/ ./app/
+# Ensure model and other data files are available in the image
+COPY data/ ./data/
 
 EXPOSE 8000
 
