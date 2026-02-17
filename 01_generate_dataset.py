@@ -7,8 +7,8 @@ from pathlib import Path
 from tqdm import tqdm
 
 # Edit this to adjust the size according to your machine's memory
-TRAIN_NUM_FILES = 80
-TEST_NUM_FILES = 8
+TRAIN_NUM_FILES = 1
+TEST_NUM_FILES = 5
 
 # DO NOT EDIT THE CODE BELOW
 NUM_USERS = 1_000_000

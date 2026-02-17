@@ -1,4 +1,3 @@
-# load_test.py - Load testing script for the recommendation API
 import asyncio
 import time
 import statistics
@@ -15,11 +14,9 @@ TARGET_P95_MS = 100  # Target 95th percentile in milliseconds
 
 
 async def make_request(client: httpx.AsyncClient, request_data: dict) -> tuple:
-    """Make a single request and return (success, latency_ms)."""
     user_id = f"u{request_data['user_id']:05d}"
     url = f"{BASE_URL}/recommend/{user_id}"
     
-    # Convert numpy arrays to lists for JSON serialization
     candidate_ids = request_data["candidate_restaurant_ids"]
     if hasattr(candidate_ids, 'tolist'):
         candidate_ids = candidate_ids.tolist()
@@ -48,7 +45,6 @@ async def make_request(client: httpx.AsyncClient, request_data: dict) -> tuple:
 
 
 async def run_load_test():
-    """Run the load test."""
     print("=" * 60)
     print("LOAD TEST - Restaurant Recommendation API")
     print("=" * 60)

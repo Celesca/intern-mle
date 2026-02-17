@@ -1,5 +1,5 @@
 import math
-from typing import List, Optional
+from typing import List
 from contextlib import asynccontextmanager
 
 import numpy as np
@@ -7,10 +7,11 @@ import torch
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import redis.asyncio as redis
-import pickle
 
-from config import REDIS_HOST, REDIS_PORT, CACHE_TTL, EARTH_RADIUS_METERS
-from loader import load_model, load_user_features, load_restaurant_features
+from .config import REDIS_HOST, REDIS_PORT, EARTH_RADIUS_METERS
+from .loader import load_model
+from .database import FeatureDatabase
+from .h3_utils import filter_by_h3_proximity
 
 
 class RecommendRequest(BaseModel):
@@ -35,11 +36,7 @@ class RecommendResponse(BaseModel):
 class AppState:
     model: torch.jit.ScriptModule = None
     redis_client: redis.Redis = None
-    user_features: np.ndarray = None
-    user_id_to_idx: dict = None
-    restaurant_features: np.ndarray = None
-    restaurant_locations: np.ndarray = None  # (lat, lon) pairs
-    restaurant_id_to_idx: dict = None
+    db: FeatureDatabase = None
 
 
 state = AppState()
@@ -62,107 +59,64 @@ def haversine_distance(lat1: float, lon1: float, lat2: np.ndarray, lon2: np.ndar
     return EARTH_RADIUS_METERS * c
 
 
-def get_cache_key(user_id: str, request: RecommendRequest) -> str:
-
-    candidates_hash = hash(tuple(sorted(request.candidate_restaurant_ids)))
-    return f"""recommend:{user_id}
-                        :{candidates_hash}
-                        :{request.latitude:.6f}
-                        :{request.longitude:.6f}
-                        :{request.size}
-                        :{request.max_dist}
-                        :{request.sort_dist}"""
-
-async def get_user_features(user_id: int) -> Optional[np.ndarray]:
-
-    cache_key = f"user:{user_id}"
-    
-    if state.redis_client:
-        try:
-            cached = await state.redis_client.get(cache_key)
-            if cached:
-                return pickle.loads(cached)
-        except Exception:
-            pass 
-    
-    if user_id in state.user_id_to_idx: # Get from "database" (pre-loaded numpy array)
-        idx = state.user_id_to_idx[user_id]
-        features = state.user_features[idx]
-        
-        if state.redis_client: # Cache
-            try:
-                await state.redis_client.setex(cache_key, CACHE_TTL, pickle.dumps(features))
-            except Exception:
-                pass
-        
-        return features
-    
-    return None
-
-
-async def get_restaurant_data(restaurant_ids: List[int]) -> tuple:
-
-    valid_ids = []
-    valid_indices = []
-    
-    for rid in restaurant_ids:
-        if rid in state.restaurant_id_to_idx:
-            valid_ids.append(rid)
-            valid_indices.append(state.restaurant_id_to_idx[rid])
-    
-    if not valid_ids:
-        return None, None, None, []
-    
-    valid_indices = np.array(valid_indices)
-    
-    features = state.restaurant_features[valid_indices]
-
-    locations = state.restaurant_locations[valid_indices]
-    latitudes = locations[:, 0]
-    longitudes = locations[:, 1]
-    
-    return features, latitudes, longitudes, valid_ids
-
 async def run_inference(
     user_id: str,
     request: RecommendRequest
 ) -> RecommendResponse:
-
+    
     # Parse user_id (e.g., "u00000" -> 0)
     try:
         user_id_int = int(user_id.lstrip('u'))
     except ValueError:
         raise HTTPException(status_code=400, detail=f"Invalid user_id format: {user_id}")
     
-    # Get user features
-    user_features = await get_user_features(user_id_int)
+    # Get user features from database
+    user_features = await state.db.get_user_features(user_id_int)
     if user_features is None:
         raise HTTPException(status_code=404, detail=f"User {user_id} not found")
     
-    # Get restaurant data
-    rest_features, rest_lats, rest_lons, valid_ids = await get_restaurant_data(
+    # Get restaurant data from database (batch query)
+    rest_features, rest_lats, rest_lons, valid_ids = await state.db.get_restaurants_batch(
         request.candidate_restaurant_ids
     )
     
     if not valid_ids:
         return RecommendResponse(restaurants=[])
     
-    # Calculate distances (vectorized)
-    distances = haversine_distance(
+    # Step 1: H3 pre-filter for fast proximity check
+    # This quickly eliminates restaurants outside the search radius using hexagonal grid
+    h3_filtered_indices = filter_by_h3_proximity(
         request.latitude, request.longitude,
-        rest_lats, rest_lons
+        rest_lats.tolist(), rest_lons.tolist(),
+        valid_ids,
+        request.max_dist
     )
     
-    # Filter by max_dist
+    if not h3_filtered_indices:
+        return RecommendResponse(restaurants=[])
+    
+    # Apply H3 pre-filter
+    h3_filtered_ids = [valid_ids[i] for i in h3_filtered_indices]
+    h3_filtered_features = rest_features[h3_filtered_indices]
+    h3_filtered_lats = rest_lats[h3_filtered_indices]
+    h3_filtered_lons = rest_lons[h3_filtered_indices]
+    
+    # Step 2: Calculate exact haversine distances (only for H3-filtered candidates)
+    distances = haversine_distance(
+        request.latitude, request.longitude,
+        h3_filtered_lats, h3_filtered_lons
+    )
+    
+    # Step 3: Final filter by exact max_dist
     within_range_mask = distances <= request.max_dist
     
     if not np.any(within_range_mask):
         return RecommendResponse(restaurants=[])
     
-    # Apply filter
+    # Apply exact distance filter
     filtered_indices = np.where(within_range_mask)[0]
-    filtered_ids = [valid_ids[i] for i in filtered_indices]
-    filtered_features = rest_features[filtered_indices]
+    filtered_ids = [h3_filtered_ids[i] for i in filtered_indices]
+    filtered_features = h3_filtered_features[filtered_indices]
     filtered_distances = distances[filtered_indices]
     
     # Prepare input tensor for model
@@ -201,13 +155,9 @@ async def run_inference(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-
     state.model = load_model()
     
-    state.user_features, state.user_id_to_idx = load_user_features()
-    state.restaurant_features, state.restaurant_locations, state.restaurant_id_to_idx = load_restaurant_features()
-    
-    # Redis caching
+    # db
     try:
         state.redis_client = redis.Redis(
             host=REDIS_HOST,
@@ -215,14 +165,16 @@ async def lifespan(app: FastAPI):
             decode_responses=False
         )
         await state.redis_client.ping()
-        print("Redis connected successfully")
+        state.db = FeatureDatabase(state.redis_client)
+        print("Redis database connected successfully")
     except Exception as e:
         print(f"Redis connection failed: {e}")
-        print("Continuing without Redis caching...")
-        state.redis_client = None
+        raise RuntimeError("Cannot start server without Redis database")
     
     yield
     
+    # Cleanup
+    print("Shutdown server")
     if state.redis_client:
         await state.redis_client.close()
 
